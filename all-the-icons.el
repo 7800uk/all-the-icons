@@ -105,6 +105,58 @@
   :group 'appearance
   :group 'convenience)
 
+(defvar all-the-icons--caches nil
+  "Hash tables memoising icons; emptied by `all-the-icons-clear-cache'.")
+
+(defun all-the-icons-clear-cache ()
+  "Forget every memoised icon and font measurement.
+Icons made before a change of `all-the-icons-cell-width',
+`all-the-icons-cell-fill' or of the default font's family are
+then made afresh."
+  (interactive)
+  (mapc #'clrhash all-the-icons--caches))
+
+(defun all-the-icons--set-and-clear-cache (symbol value)
+  "Set SYMBOL to VALUE and clear the icon caches."
+  (set-default-toplevel-value symbol value)
+  (all-the-icons-clear-cache))
+
+(defcustom all-the-icons-cell-width 1
+  "Number of columns of monospace text each icon occupies, or nil.
+
+When this is a positive integer, every icon is drawn as exactly
+that many character cells of the face around it (normally
+`default'), with the glyph scaled to fit inside the cell and the
+line height, and centred in it horizontally and vertically.  The
+width is worked out by the display engine whenever the icon is
+displayed, so it holds on any frame and under `text-scale-mode',
+`text-scale-adjust', `global-text-scale-adjust' and face
+remapping.  The `:height' and `:v-adjust' arguments of the icon
+functions, `all-the-icons-scale-factor', `all-the-icons-default-adjust'
+and the per-family scale factors and adjustments are then ignored;
+use `all-the-icons-cell-fill' to make icons smaller.
+
+When nil, icons are sized as upstream all-the-icons sizes them:
+an icon font glyph scaled by `:height' and raised by `:v-adjust',
+whose width is that of the glyph.
+
+Cell sizing needs Emacs 29.1 or later and a graphical frame;
+otherwise icons are sized as for nil."
+  :group 'all-the-icons
+  :type '(choice (const :tag "Upstream sizing" nil)
+                 (const :tag "One column" 1)
+                 (const :tag "Two columns" 2)
+                 (natnum :tag "Columns"))
+  :set #'all-the-icons--set-and-clear-cache)
+
+(defcustom all-the-icons-cell-fill 0.9
+  "Largest fraction of its cell an icon's ink may cover.
+It applies both to the cell's width and to the line height.  It
+only matters when `all-the-icons-cell-width' is non-nil."
+  :group 'all-the-icons
+  :type 'number
+  :set #'all-the-icons--set-and-clear-cache)
+
 (defcustom all-the-icons-color-icons t
   "Whether or not to include a foreground colour when formatting the icon."
   :group 'all-the-icons
@@ -126,6 +178,9 @@
   :type 'directory)
 
 (defvar all-the-icons-font-families '() "List of defined icon font families.")
+(defconst all-the-icons--source-file
+  (or load-file-name (bound-and-true-p byte-compile-current-file) buffer-file-name)
+  "The file this package was loaded from.")
 (defvar all-the-icons-font-names '() "List of defined font file names this package was built with.")
 
 (defvar all-the-icons-extension-icon-alist
@@ -1041,14 +1096,16 @@ inserting functions."
     (let ((cache (make-hash-table :test #'equal
                                   :size all-the-icons--cache-limit))
           (orig-fn (symbol-function func)))
+      (push cache all-the-icons--caches)
       (fset func
             (lambda (&rest args)
-              (or (gethash args cache)
-                  (progn
-                    (when (> (hash-table-count cache)
-                             all-the-icons--cache-limit)
-                      (clrhash cache))
-                    (puthash args (apply orig-fn args) cache)))))))
+              (let ((key (cons (all-the-icons--cell-key) args)))
+                (or (gethash key cache)
+                    (progn
+                      (when (> (hash-table-count cache)
+                               all-the-icons--cache-limit)
+                        (clrhash cache))
+                      (puthash key (apply orig-fn args) cache))))))))
 
   (put func 'all-the-icons--cached t))
 
@@ -1074,8 +1131,18 @@ inserting functions."
     (if icon (funcall (intern (format "%s-family" (car icon)))) nil)))
 
 (defun all-the-icons-icon-family (icon)
-  "Get a propertized ICON family programmatically."
-  (plist-get (get-text-property 0 'face icon) :family))
+  "Get a propertized ICON family programmatically.
+The family is read from the first character of ICON whose face
+names one, since an icon sized to a cell (see
+`all-the-icons-cell-width') starts with a padding character."
+  (cl-loop for i below (length icon)
+           for face = (get-text-property i 'face icon)
+           for family = (cond ((keywordp (car-safe face)) (plist-get face :family))
+                              ((consp face)
+                               (cl-loop for f in face
+                                        thereis (and (keywordp (car-safe f))
+                                                     (plist-get f :family)))))
+           when family return family))
 
 (all-the-icons-cache #'all-the-icons-icon-family-for-file)
 (all-the-icons-cache #'all-the-icons-icon-family-for-mode)
@@ -1125,6 +1192,256 @@ When F is provided, the info function is calculated with the format
   (defun all-the-icons--family-adjust (family)
     (intern (concat "all-the-icons-default-" (symbol-name family) "-adjust"))))
 
+;; Monospace cells
+;;
+;; An icon sized to a cell is three characters:
+;;
+;;   L  a space displayed as a stretch of LEFT times the width of its
+;;      own face's font, which centres the glyph;
+;;   I  the icon character in its icon font, scaled by a relative
+;;      `:height' and raised by a `raise' so that its ink fits the
+;;      cell and the line height and is centred in both;
+;;   R  an empty stretch.
+;;
+;; L and I share one (eq) `min-width' spec of (N . width).  When the
+;; display engine reaches R it pads L and I with a stretch to exactly
+;; N times the average width of R's font; R has no face, so that is
+;; the font of the face around the icon (normally `default', remapped
+;; and text-scaled as the buffer has it).  The total width is
+;; therefore exact whatever the glyph's own rounding, and nothing is
+;; in pixels: the height, raise and left padding are ratios taken
+;; from the font metrics, which hold at any font size.
+
+(defconst all-the-icons--reference-size 200
+  "Pixel size at which icon fonts are opened to measure their glyphs.")
+
+(defvar all-the-icons--metrics-cache (make-hash-table :test #'equal)
+  "Glyph measurements, keyed by (FAMILY . CHAR).")
+(push all-the-icons--metrics-cache all-the-icons--caches)
+
+(defun all-the-icons--graphic-frame ()
+  "A graphical frame to measure fonts on, or nil."
+  (if (display-graphic-p)
+      (selected-frame)
+    (cl-find-if #'display-graphic-p (frame-list))))
+
+(defun all-the-icons--glyph-metrics (family char frame)
+  "Measurements of CHAR in font FAMILY on FRAME, per pixel of font size.
+Return a vector [ASCENT DESCENT WIDTH LBEARING RBEARING INK-ASCENT
+INK-DESCENT]: the font's ascent and descent, then the glyph's
+advance, bearings and ink extents.  Return `missing' when FAMILY
+has no glyph for CHAR, and nil when FAMILY is not installed."
+  (let ((key (cons family char)))
+    (pcase (gethash key all-the-icons--metrics-cache 'none)
+      ('none
+       (puthash
+        key
+        (let* ((size all-the-icons--reference-size)
+               (entity (find-font (font-spec :family family) frame))
+               (font (and entity (open-font entity size frame)))
+               (info (and font (query-font font)))
+               (glyph (and font (aref (font-get-glyphs font 0 1 (string char)) 0))))
+          (cond
+           ((not info) nil)
+           ((not (and glyph (> (aref glyph 4) 0))) 'missing)
+           (t
+            (let ((px (float (aref info 2))))
+              (vector (/ (aref info 4) px) (/ (aref info 5) px)
+                      (/ (aref glyph 4) px) (/ (aref glyph 5) px) (/ (aref glyph 6) px)
+                      (/ (aref glyph 7) px) (/ (aref glyph 8) px))))))
+        all-the-icons--metrics-cache))
+      (metrics metrics))))
+
+(defun all-the-icons--remapped-family ()
+  "The family `default' is remapped to in the current buffer, or nil.
+See `face-remapping-alist'; nil means the frame's own default."
+  (cl-labels ((walk (spec)
+                (cond ((null spec) nil)
+                      ((eq spec 'default) (throw 'all-the-icons--family nil))
+                      ((keywordp (car-safe spec))
+                       (let ((family (plist-get spec :family)))
+                         (when (stringp family)
+                           (throw 'all-the-icons--family family))))
+                      ((and (symbolp spec) (facep spec))
+                       (let ((family (face-attribute spec :family nil 'default)))
+                         (when (stringp family)
+                           (throw 'all-the-icons--family family))))
+                      ((consp spec) (walk (car spec)) (walk (cdr spec))))))
+    (let ((family (catch 'all-the-icons--family
+                    (walk (cdr (assq 'default face-remapping-alist)))
+                    nil)))
+      (unless (equal family (face-attribute 'default :family))
+        family))))
+
+(defun all-the-icons--cell-key ()
+  "What a cell-sized icon made in the current buffer depends on."
+  (and all-the-icons-cell-width
+       (list all-the-icons-cell-width all-the-icons-cell-fill
+             (all-the-icons--remapped-family))))
+
+(defun all-the-icons--font-metrics (font)
+  "Vector [ASCENT DESCENT WIDTH] of font object FONT, per pixel of size."
+  (let* ((info (and (fontp font 'font-object) (query-font font)))
+         (px (and info (float (aref info 2)))))
+    (when (and px (> px 0))
+      (vector (/ (aref info 4) px) (/ (aref info 5) px)
+              (/ (let ((avg (aref info 7))) (if (> avg 0) avg (aref info 6))) px)))))
+
+(defun all-the-icons--cell-metrics (frame)
+  "Measurements of the cell font on FRAME, per pixel of font size.
+The cell font is that of `default', or of the family `default' is
+remapped to in the current buffer.  Return a vector [ASCENT
+DESCENT WIDTH], or nil."
+  (let ((family (all-the-icons--remapped-family))
+        (default (face-attribute 'default :font frame)))
+    (if (not family)
+        (all-the-icons--font-metrics default)
+      ;; Measure at the frame's font size: average widths do not scale
+      ;; exactly with size, least of all for proportional fonts.
+      (let* ((size (if (fontp default 'font-object)
+                       (aref (query-font default) 2)
+                     all-the-icons--reference-size))
+             (key (list 'cell family size)))
+        (pcase (gethash key all-the-icons--metrics-cache 'none)
+          ('none
+           (puthash key
+                    (let ((entity (find-font (font-spec :family family) frame)))
+                      (and entity
+                           (all-the-icons--font-metrics (open-font entity size frame))))
+                    all-the-icons--metrics-cache))
+          (metrics metrics))))))
+
+(defconst all-the-icons--cell-slack 0.06
+  "Fraction of the font size kept free above, below and right of an icon.
+It absorbs the rounding of font metrics to whole pixels, so that
+an icon never makes its line taller or its cell wider.")
+
+(defun all-the-icons--drawing-family (family char)
+  "The font family Emacs draws CHAR with when a face asks for FAMILY.
+Emacs draws characters of the `emoji' script with its emoji font
+whatever the face says, and a few icons sit on emoji code points."
+  (or (and (eq (aref char-script-table char) 'emoji)
+           (let ((font (car-safe (ignore-errors (internal-char-font nil char)))))
+             (and (fontp font)
+                  (let ((drawn (font-get font :family)))
+                    (if (symbolp drawn) (symbol-name drawn) drawn)))))
+      family))
+
+(defun all-the-icons--cell-layout (family char &optional columns)
+  "How to fit CHAR of icon font FAMILY into COLUMNS cells.
+Return (HEIGHT RAISE LEFT): the icon face's relative height, its
+`raise' factor, and the left padding in units of the cell font's
+width.  COLUMNS defaults to `all-the-icons-cell-width'.  Return
+`missing' when FAMILY has no glyph for CHAR, and nil when the
+fonts cannot be measured."
+  (let* ((frame (all-the-icons--graphic-frame))
+         (cell (and frame (all-the-icons--cell-metrics frame)))
+         (drawn (all-the-icons--drawing-family family char))
+         (glyph (and cell (all-the-icons--glyph-metrics drawn char frame))))
+    (if (eq glyph 'missing)
+        'missing
+      (when glyph
+	(pcase-let* ((`[,asc ,desc ,width] cell)
+                     (`[,f-asc ,f-desc ,advance ,lbearing ,rbearing ,ink-asc ,ink-desc] glyph)
+                     (fill all-the-icons-cell-fill)
+                     (cell-w (* (or columns all-the-icons-cell-width) width))
+                     (ink-w (max (- rbearing lbearing) 1e-3))
+                     (ink-h (max (+ ink-asc ink-desc) 1e-3))
+                     (ink-x (/ (+ lbearing rbearing) 2.0)) ; ink centre from the origin
+                     (ink-y (/ (- ink-asc ink-desc) 2.0))  ; ink centre above the baseline
+                     (line-y (/ (- asc desc) 2.0))         ; centre of the line
+                     (top (- asc all-the-icons--cell-slack))
+                     (bottom (- desc all-the-icons--cell-slack))
+                     ;; Ink within the fill fraction of the cell and the line.
+                     (scale (min (/ (* fill cell-w) ink-w)
+				 (/ (* fill (+ asc desc)) ink-h)))
+                     (raise 0.0))
+          ;; With the ink centred, the glyph's origin must not go left of
+          ;; the cell nor its advance past the right edge, or `min-width'
+          ;; could not make the total exact.
+          (when (> ink-x 0)
+            (setq scale (min scale (/ cell-w 2.0 ink-x))))
+          (when (> (- advance ink-x) 0)
+            (setq scale (min scale (/ (- cell-w all-the-icons--cell-slack)
+                                      2.0 (- advance ink-x)))))
+          ;; The font's box, raised to centre the ink, must stay inside the
+          ;; line: `raise' adds to the ascent (or descent) of the glyph
+          ;; without taking from the other.
+          (let ((tries 0))
+            (while (progn
+                     (setq raise (- line-y (* ink-y scale)))
+                     (and (< tries 100)
+                          (or (> (+ (* f-asc scale) (max raise 0.0)) top)
+                              (> (+ (* f-desc scale) (max (- raise) 0.0)) bottom))))
+              (setq scale (* scale 0.97)
+                    tries (1+ tries))))
+          (let ((left (/ (- (/ cell-w 2.0) (* ink-x scale)) width)))
+            ;; Emoji fonts do not scale linearly (Apple Color Emoji is
+            ;; wider than its size at small sizes), so fit those glyphs
+            ;; by measuring them at the size they will be drawn on FRAME.
+            (unless (equal drawn family)
+              (let* ((size (aref (query-font (face-attribute 'default :font frame)) 2))
+                     (entity (find-font (font-spec :family drawn) frame))
+                     (room (* (- cell-w all-the-icons--cell-slack) size))
+                     advance-px)
+		(while (and entity
+                            (> scale 0.2)
+                            (let* ((font (open-font entity (max 1 (round (* scale size))) frame))
+                                   (g (aref (font-get-glyphs font 0 1 (string char)) 0)))
+                              (setq advance-px (and g (aref g 4)))
+                              (and advance-px (> advance-px room))))
+                  (setq scale (* scale 0.9)))
+		(when advance-px
+                  (setq left (max 0.0 (/ (- (* cell-w size) advance-px) 2.0 (* width size)))))))
+            (list scale
+                  (/ raise (* (+ f-asc f-desc) scale))
+                  (max 0.0 left))))))))
+
+(defun all-the-icons--cell-icon (icon family other-face)
+  "ICON of font FAMILY fitted to `all-the-icons-cell-width' columns.
+OTHER-FACE, when non-nil, is inherited by the icon's face.  Return
+nil when the icon cannot be fitted."
+  (when-let* (((natnump all-the-icons-cell-width))
+              ((> all-the-icons-cell-width 0))
+              ((fboundp 'get-display-property)) ; `min-width' is Emacs 29+
+              (layout (all-the-icons--cell-layout family (string-to-char icon))))
+    ;; An icon whose font lacks its glyph becomes an empty cell, which
+    ;; keeps the columns after it in place.
+    (pcase-let* ((`(,height ,raise ,left) (if (eq layout 'missing) '(0.1 0 0) layout))
+                 (face `(:family ,family :height ,height
+                         ,@(when other-face (list :inherit other-face))))
+                 (min-width (list (cons all-the-icons-cell-width 'width))))
+      (concat
+       (propertize " "
+                   'display `((min-width ,min-width) (space :width (,left . width)))
+                   'rear-nonsticky t)
+       (propertize icon
+                   'face face           ;so that this works without `font-lock-mode' enabled
+                   'font-lock-face face ;so that `font-lock-mode' leaves this alone
+                   'display `((min-width ,min-width)
+                              ,(if (eq layout 'missing) '(space :width 0) `(raise ,raise)))
+                   'rear-nonsticky t)
+       (propertize " "
+                   'display '(space :width 0)
+                   'rear-nonsticky t)))))
+
+(defun all-the-icons--propertize (icon family height v-adjust other-face)
+  "Propertize the icon character ICON of font FAMILY.
+When `all-the-icons-cell-width' is non-nil, fit it to that many
+cells and ignore HEIGHT and V-ADJUST.  Otherwise give it a face of
+FAMILY at relative HEIGHT, raised by V-ADJUST.  OTHER-FACE, when
+non-nil, is inherited by the icon's face."
+  (or (and all-the-icons-cell-width
+           (all-the-icons--cell-icon icon family other-face))
+      (let ((face (if other-face
+                      `(:family ,family :height ,height :inherit ,other-face)
+                    `(:family ,family :height ,height))))
+        (propertize icon
+                    'face face           ;so that this works without `font-lock-mode' enabled
+                    'font-lock-face face ;so that `font-lock-mode' leaves this alone
+                    'display `(raise ,v-adjust)
+                    'rear-nonsticky t))))
+
 ;; Icon insertion functions
 
 (defun all-the-icons--read-candidates ()
@@ -1151,12 +1468,24 @@ If SHOW-FAMILY is non-nil, displays the icons family in the candidate string."
          (cons candidate-name candidate-icon)))
      data)))
 
+(defun all-the-icons--local-fonts-directory ()
+  "The `fonts' directory of this package's source tree, or nil.
+Package managers that build from a symlink farm (straight.el, for
+one) leave the fonts in the repository, so follow the symlink of
+this file back to it."
+  (let* ((lib (or all-the-icons--source-file (locate-library "all-the-icons")))
+         (dir (and lib (expand-file-name
+                        "fonts" (file-name-directory (file-truename lib))))))
+    (and dir (file-directory-p dir) dir)))
+
 ;;;###autoload
 (defun all-the-icons-install-fonts (&optional pfx)
-  "Helper function to download and install the latests fonts based on OS.
+  "Helper function to install the fonts based on OS.
+The fonts are copied from the package's own `fonts' directory when
+it can be found, and otherwise downloaded from upstream.
 When PFX is non-nil, ignore the prompt and just install"
   (interactive "P")
-  (when (or pfx (yes-or-no-p "This will download and install fonts, are you sure you want to do this?"))
+  (when (or pfx (yes-or-no-p "This will install fonts, are you sure you want to do this?"))
     (let* ((url-format "https://raw.githubusercontent.com/domtronn/all-the-icons.el/master/fonts/%s")
            (font-dest (cond
                        ;; Default Linux install directories
@@ -1175,12 +1504,19 @@ When PFX is non-nil, ignore the prompt and just install"
 
       (unless (file-directory-p font-dest) (mkdir font-dest t))
 
-      (mapc (lambda (font)
-              (url-copy-file (format url-format font) (expand-file-name font font-dest) t))
-            all-the-icons-font-names)
-      (when known-dest?
-        (message "Fonts downloaded, updating font cache... <fc-cache -f -v> ")
+      (let ((local (all-the-icons--local-fonts-directory)))
+        (mapc (lambda (font)
+                (let ((src (and local (expand-file-name font local)))
+                      (dest (expand-file-name font font-dest)))
+                  (if (and src (file-readable-p src))
+                      (copy-file src dest t)
+                    (url-copy-file (format url-format font) dest t))))
+              all-the-icons-font-names))
+      (when (and known-dest? (executable-find "fc-cache"))
+        (message "Fonts installed, updating font cache... <fc-cache -f -v> ")
         (shell-command-to-string (format "fc-cache -f -v")))
+      (clear-font-cache)
+      (all-the-icons-clear-cache)
       (message "%s Successfully %s `all-the-icons' fonts to `%s'!"
                (all-the-icons-wicon "stars" :v-adjust 0.0)
                (if known-dest? "installed" "downloaded")
@@ -1252,6 +1588,11 @@ FONT-NAME is the name of the .ttf file providing the font, defaults to FAMILY."
      (defun ,(all-the-icons--family-name name) () ,family)
      (defun ,(all-the-icons--data-name name) () ,alist)
      (defun ,(all-the-icons--function-name name) (icon-name &rest args)
+       ,(format "Return the %s icon ICON-NAME as a propertized string.
+ARGS is a plist of `:face', `:height' and `:v-adjust'.  When
+`all-the-icons-cell-width' is non-nil the icon is fitted to that
+many columns and `:height' and `:v-adjust' are ignored; see
+`all-the-icons--propertize'." family)
        (let ((icon (cdr (assoc icon-name ,alist)))
              (other-face (when all-the-icons-color-icons (plist-get args :face)))
              (height   (* all-the-icons-scale-factor
@@ -1263,14 +1604,7 @@ FONT-NAME is the name of the .ttf file providing the font, defaults to FAMILY."
              (family ,family))
          (unless icon
            (error (format "Unable to find icon with name `%s' in icon set `%s'" icon-name (quote ,name))))
-         (let ((face (if other-face
-                         `(:family ,family :height ,height :inherit ,other-face)
-                       `(:family ,family :height ,height))))
-           (propertize icon
-                       'face face           ;so that this works without `font-lock-mode' enabled
-                       'font-lock-face face ;so that `font-lock-mode' leaves this alone
-                       'display `(raise ,v-adjust)
-                       'rear-nonsticky t))))
+         (all-the-icons--propertize icon family height v-adjust other-face)))
      (defun ,(all-the-icons--insert-function-name name) (&optional arg)
        ,(format "Insert a %s icon at point." family)
        (interactive "P")
