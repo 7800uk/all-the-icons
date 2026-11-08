@@ -28,6 +28,8 @@
 
 ;;; Code:
 
+(require 'cl-lib)
+
 (defgroup all-the-icons-faces nil
   "Manage how All The Icons icons are coloured and themed."
   :prefix "all-the-icons-"
@@ -224,6 +226,55 @@
     (((background light)) :foreground "#838484"))
   "Face for dsilver icons"
   :group 'all-the-icons-faces)
+
+
+;; Palette
+
+(defun all-the-icons-faces ()
+  "The faces that colour icons, as symbols."
+  (cl-loop for (member type) in (get 'all-the-icons-faces 'custom-group)
+           when (eq type 'custom-face) collect member))
+
+(defvar all-the-icons-palette)
+
+(defvar all-the-icons--palette-faces nil
+  "Faces whose foreground `all-the-icons-apply-palette' has overridden.")
+
+(defun all-the-icons-apply-palette (&optional palette)
+  "Colour the icon faces from PALETTE, by default `all-the-icons-palette'.
+PALETTE is an alist of (FACE . COLOUR).  Each FACE named in it gets
+COLOUR as its foreground, over any theme; every other icon face
+goes back to its own colours."
+  (let ((palette (or palette all-the-icons-palette)))
+    (dolist (face (delete-dups (append (mapcar #'car palette)
+                                       all-the-icons--palette-faces)))
+      (when (facep face)
+        (let ((colour (alist-get face palette)))
+          (face-spec-set face (and colour `((t :foreground ,colour)))
+                         'face-override-spec))))
+    (setq all-the-icons--palette-faces (mapcar #'car palette))))
+
+(defcustom all-the-icons-palette nil
+  "Colours of the icon faces, as an alist of (FACE . COLOUR).
+
+FACE is one of the faces `all-the-icons-faces' lists, such as
+`all-the-icons-red' or `all-the-icons-lblue'; COLOUR is a colour
+name or \"#RRGGBB\" string.  The faces named here take COLOUR as
+their foreground, overriding the package's own colours and any
+theme; faces left out keep theirs.  nil leaves every face alone.
+
+Setting this with `setopt', `customize-set-variable' or Customize
+re-applies the faces at once; after `setq', call
+`all-the-icons-apply-palette', or use `all-the-icons-set-palette'."
+  :group 'all-the-icons-faces
+  :type '(alist :key-type (face :tag "Icon face") :value-type (color :tag "Colour"))
+  :set (lambda (symbol value)
+         (set-default-toplevel-value symbol value)
+         (all-the-icons-apply-palette value)))
+
+(defun all-the-icons-set-palette (palette)
+  "Set `all-the-icons-palette' to PALETTE and re-colour the icon faces."
+  (customize-set-variable 'all-the-icons-palette palette))
 
 
 (provide 'all-the-icons-faces)
