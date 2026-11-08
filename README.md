@@ -18,6 +18,16 @@
   <a href="https://github.com/domtronn/all-the-icons.el/blob/master/LICENSE"><img src="https://img.shields.io/github/license/mashape/apistatus.svg"></a>
 </p>
 
+> **This is the [7800uk](https://gitlab.7800.io/7800uk/all-the-icons) fork
+> of [domtronn/all-the-icons.el](https://github.com/domtronn/all-the-icons.el).**
+> It adds two things and otherwise keeps upstream's API, data and fonts:
+>
+> - [**Icons in monospace cells**](#icons-in-monospace-cells): every icon
+>   takes exactly `all-the-icons-cell-width` columns of the text around it,
+>   centred, at any text scale, on any frame.
+> - [**A colour palette**](#colour-palette): `all-the-icons-palette` recolours
+>   the icon faces from an alist.
+
 # Installation
 
 You should be able to install this package in the standard way, add it
@@ -31,6 +41,18 @@ to the load path and then calling
   :if (display-graphic-p))
 ```
 
+With [straight.el](https://github.com/radian-software/straight.el), this fork
+is installed with the recipe below.  `:host nil` is needed because straight
+merges in MELPA's recipe for `all-the-icons`, whose `:files` (`:defaults` and
+`data`) already cover the code and data, so `:files` need not be given.
+
+```el
+(use-package all-the-icons
+  :straight (all-the-icons :type git :host nil
+                           :repo "https://gitlab.7800.io/7800uk/all-the-icons.git")
+  :if (display-graphic-p))
+```
+
 ### Installing Fonts
 
 In order for the icons to work it is **very important** that you install
@@ -40,6 +62,11 @@ fonts for this package in the *(guessed?)* based on the OS by calling
 the following function;
 
     M-x all-the-icons-install-fonts
+
+In this fork the function copies the fonts from the package's own `fonts`
+directory (following straight.el's symlinks back to the repository) and only
+downloads them from upstream when that directory cannot be found.  On macOS
+they go to `~/Library/Fonts`, and a running Emacs picks them up straight away.
 
 Bear in mind, this will also run `fc-cache -f -v` on **MacOS** and
 **Linux** which *can take some time* to complete. For **Windows**, this
@@ -120,7 +147,11 @@ and `all-the-icons-icon-for-mode` functions as well, *i.e.*
     ;; #("js-icon" 0 1 (display (raise -0.24) face (:family "alltheicon" :height 2.0 :foreground "red")))
 ```
 
-The default icon `:height` and `:v-adjust` properties can be set with
+With `all-the-icons-cell-width` non-nil (the default in this fork),
+`:height` and `:v-adjust` are ignored: the icon is fitted to its cell
+instead.  See [Icons in monospace cells](#icons-in-monospace-cells).
+
+Under upstream sizing (`all-the-icons-cell-width` set to nil), the default icon `:height` and `:v-adjust` properties can be set with
 the `all-the-icons-scale-factor` and `all-the-icons-default-adjust`
 variables. Additional adjustments can be made per font family via the
 `all-the-icons-{familyname}-scale-factor` and
@@ -138,6 +169,139 @@ font family to add in to override the current font family being used,
 (propertize (all-the-icons-octicon "package")
             'face `(:family ,(all-the-icons-octicon-family) :height 1.2)
             'display '(raise -0.1))
+```
+
+That replaces the icon's own `face` and `display` properties, and with them
+the cell sizing below.  To colour or emphasise a cell-sized icon, pass
+`:face`, or add a face with `add-face-text-property`, which keeps the
+icon's own:
+
+```el
+(let ((icon (all-the-icons-octicon "package")))
+  (add-face-text-property 0 (length icon) 'all-the-icons-lblue nil icon)
+  icon)
+```
+
+## Icons in monospace cells
+
+Upstream draws an icon as a glyph of an icon font at a relative `:height`,
+so it comes out wider or narrower than a character, and text after it
+drifts out of its column.  In this fork every icon occupies exactly
+
+```el
+all-the-icons-cell-width   ; default 1; 2 for double-width icons; nil for upstream sizing
+```
+
+columns of the face it is displayed in (normally `default`).  The glyph is
+scaled to fit inside the cell and the line height, so it never makes a line
+taller, and it is centred in the cell horizontally and vertically.
+
+The width is not baked in at insertion.  Each icon is three characters: a
+padding stretch, the glyph, and an empty stretch, with the first two
+sharing one `min-width` display spec of `(N . width)`.  The display engine
+pads them to exactly N times the width of the surrounding face's font
+every time it draws the line, so the alignment holds
+
+- on every frame and display, whatever its scale;
+- under `text-scale-mode` / `text-scale-adjust` and `global-text-scale-adjust`;
+- after the default font size or family changes, and under face remapping
+  (`face-remap-add-relative`, `buffer-face-mode`): the remapped family in
+  the buffer where an icon is made is measured, and icons are memoised
+  separately per family.
+
+The glyph's scale, `raise` and left padding are ratios taken from the font
+metrics (`query-font`, `font-get-glyphs`), so they also hold at any size.
+
+Related options and commands:
+
+- `all-the-icons-cell-fill` (default 0.9): the largest fraction of the cell's
+  width and of the line height the icon's ink may cover.  Lower it for
+  smaller icons.
+- `all-the-icons-clear-cache`: forget memoised icons and font measurements,
+  for instance after changing the default font's family.  Setting the two
+  options above with `setopt` or Customize does this for you.
+
+Under cell sizing, `:height`, `:v-adjust`, `all-the-icons-scale-factor`,
+`all-the-icons-default-adjust` and the per-family scale factors and
+adjustments are ignored.  An icon string is three characters long rather
+than one, and `all-the-icons-icon-family` finds the family on whichever
+character carries it.  Cell sizing needs Emacs 29.1 or later (for
+`min-width`) and a graphical frame; without them, or when an icon font is
+not installed, icons fall back to upstream sizing.
+
+## Colour palette
+
+The icon faces (`all-the-icons-red`, `-lred`, `-dred`, `-red-alt`, `-green`,
+`-lgreen`, `-dgreen`, `-yellow`, `-lyellow`, `-dyellow`, `-blue`,
+`-blue-alt`, `-lblue`, `-dblue`, `-maroon`, `-lmaroon`, `-dmaroon`,
+`-purple`, `-purple-alt`, `-lpurple`, `-dpurple`, `-orange`, `-lorange`,
+`-dorange`, `-cyan`, `-cyan-alt`, `-lcyan`, `-dcyan`, `-pink`, `-lpink`,
+`-dpink`, `-silver`, `-lsilver`, `-dsilver`; `(all-the-icons-faces)` lists
+them) can be recoloured from one alist of face to colour:
+
+```el
+(setopt all-the-icons-palette
+        '((all-the-icons-red  . "#FF0000")
+          (all-the-icons-blue . "#0000FF")))
+```
+
+Setting `all-the-icons-palette` with `setopt`, `customize-set-variable` or
+Customize re-applies the faces at once, as does
+`(all-the-icons-set-palette ALIST)`; after a plain `setq`, call
+`all-the-icons-apply-palette`.  The colours go in each face's override spec,
+so they win over the package's defaults and over any theme.  Faces not named
+keep their own colours, and setting the palette back to nil restores them
+all.
+
+### The 7800 palette
+
+For a config that defines the sixteen-colour 7800 palette and its
+`(yaqub/colour NAME)` accessor, this maps every icon face to a 7800
+colour.  Each face keeps its upstream hue: purple and pink go to magenta,
+orange to yellow, maroon to red, and silver to the greys.  Within the hue,
+the dark or bright 7800 colour is whichever is nearer the upstream colour's
+lightness (CIE L\*).  Every blue goes to `bright-blue`, since even the
+darkest upstream blue is lighter than it.
+
+```el
+(with-eval-after-load 'all-the-icons
+  (setopt all-the-icons-palette
+          (mapcar
+           (lambda (entry) (cons (car entry) (yaqub/colour (cdr entry))))
+           '((all-the-icons-red        . bright-red)
+             (all-the-icons-lred       . bright-red)
+             (all-the-icons-dred       . dark-red)
+             (all-the-icons-red-alt    . bright-red)
+             (all-the-icons-green      . dark-green)
+             (all-the-icons-lgreen     . bright-green)
+             (all-the-icons-dgreen     . dark-green)
+             (all-the-icons-yellow     . bright-yellow)
+             (all-the-icons-lyellow    . bright-yellow)
+             (all-the-icons-dyellow    . dark-yellow)
+             (all-the-icons-blue       . bright-blue)
+             (all-the-icons-blue-alt   . bright-blue)
+             (all-the-icons-lblue      . bright-blue)
+             (all-the-icons-dblue      . bright-blue)
+             (all-the-icons-maroon     . bright-red)
+             (all-the-icons-lmaroon    . bright-red)
+             (all-the-icons-dmaroon    . bright-red)
+             (all-the-icons-purple     . bright-magenta)
+             (all-the-icons-purple-alt . dark-magenta)
+             (all-the-icons-lpurple    . bright-magenta)
+             (all-the-icons-dpurple    . dark-magenta)
+             (all-the-icons-orange     . dark-yellow)
+             (all-the-icons-lorange    . bright-yellow)
+             (all-the-icons-dorange    . dark-yellow)
+             (all-the-icons-cyan       . dark-cyan)
+             (all-the-icons-cyan-alt   . bright-cyan)
+             (all-the-icons-lcyan      . bright-cyan)
+             (all-the-icons-dcyan      . dark-cyan)
+             (all-the-icons-pink       . bright-magenta)
+             (all-the-icons-lpink      . bright-magenta)
+             (all-the-icons-dpink      . bright-magenta)
+             (all-the-icons-silver     . bright-black)
+             (all-the-icons-lsilver    . dark-white)
+             (all-the-icons-dsilver    . bright-black)))))
 ```
 
 ## Troubleshooting
